@@ -12,18 +12,17 @@ from tensorflow.keras import models, layers
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from tensorflow.keras.layers import Dense, Conv2D
 
 # --- CONFIGURATION ---
 BATCH_SIZE = 32
 IMAGE_SIZE = 256
 CHANNELS = 3
-EPOCHS = 25
+EPOCHS = 15 # Lowered slightly because MobileNetV2 learns much faster
 MODEL_PATH = "plant_disease_model.keras"
 DATASET_DIR = "dataset"
+CONFIDENCE_THRESHOLD = 0.40 # Rejects random background photos
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
-# Ensure your dataset folder names match these keys EXACTLY.
 DISEASE_KNOWLEDGE_BASE = {
     # --- POTATO CLASSES ---
     "Potato___Early_blight": {
@@ -173,35 +172,50 @@ DISEASE_KNOWLEDGE_BASE = {
     }
 }
 
-# --- MODEL ARCHITECTURE ---
+# --- SMART MATCHER ---
+def get_solution(class_name):
+    """Ignores spaces and underscores to guarantee a match."""
+    def normalize(text):
+        return "".join(e for e in text if e.isalnum()).lower()
+    target = normalize(class_name)
+    for key, val in DISEASE_KNOWLEDGE_BASE.items():
+        if target in normalize(key) or normalize(key) in target:
+            return val
+    return DISEASE_KNOWLEDGE_BASE["default"]
+
+
+# --- UPGRADED MODEL ARCHITECTURE (MobileNetV2) ---
 def build_model(num_classes):
+    print("Building MobileNetV2 Transfer Learning Model...")
+    
+    # AGGRESSIVE AUGMENTATION: Forces the AI to ignore the background
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
-        layers.RandomRotation(0.2),
-        layers.RandomZoom(0.2),
+        layers.RandomRotation(0.3), # Rotate up to 30%
+        layers.RandomZoom(0.3),     # Zoom in/out up to 30%
         layers.RandomContrast(0.2),
+        layers.RandomTranslation(height_factor=0.2, width_factor=0.2), # Shift image off-center
     ])
 
     input_shape = (IMAGE_SIZE, IMAGE_SIZE, CHANNELS)
 
+    # Load Google's pre-trained MobileNetV2
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=input_shape,
+        include_top=False,
+        weights='imagenet'
+    )
+    # Freeze the base model so we don't destroy its pre-existing knowledge
+    base_model.trainable = False
+
     model = models.Sequential([
         layers.Input(shape=input_shape),
         data_augmentation,
-        layers.Rescaling(1./255),
-        layers.Conv2D(32, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, kernel_size=(3,3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Flatten(),
-        layers.Dense(64, activation='relu'),
+        # MobileNetV2 requires pixel values between -1 and 1
+        layers.Rescaling(1./127.5, offset=-1),
+        base_model,
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(128, activation='relu'),
         layers.Dropout(0.5), 
         layers.Dense(num_classes, activation='softmax')
     ])
@@ -251,7 +265,9 @@ def train_model():
     model = build_model(len(class_names))
     
     print("Starting training...")
-    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=1)
+    # Added Early Stopping so it stops automatically if it stops improving
+    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=1, callbacks=[early_stopping])
 
     print(f"Saving model to {MODEL_PATH}...")
     model.save(MODEL_PATH)
@@ -319,16 +335,20 @@ async def predict(file: UploadFile = File(...)):
         confidence = random.uniform(0.7, 0.99)
         status = "MOCK_RESPONSE (Train model to get real results)"
 
-    print(f"\n--- DEBUG INFO ---")
-    print(f"Predicted Class: '{predicted_class}'")
-    
-    if predicted_class in DISEASE_KNOWLEDGE_BASE:
-        print(f"Match found in Knowledge Base!")
-        solutions = DISEASE_KNOWLEDGE_BASE[predicted_class]
-    else:
-        print(f"WARNING: '{predicted_class}' NOT found in keys.")
-        solutions = DISEASE_KNOWLEDGE_BASE["default"]
-    print(f"------------------\n")
+    # Filter out low-confidence guesses
+    if confidence < CONFIDENCE_THRESHOLD:
+        return {
+            "class": "Unknown / Unclear Image",
+            "confidence": confidence,
+            "status": "Low Confidence",
+            "solutions": {
+                "description": "The AI is not confident enough to make a diagnosis. Ensure the leaf is well-lit and in focus.",
+                "treatment": ["Try capturing the leaf with a plain background (like a white piece of paper)."],
+                "prevention": ["Ensure the photo is not blurry."]
+            }
+        }
+
+    solutions = get_solution(predicted_class)
 
     return {
         "class": predicted_class,
@@ -345,4 +365,6 @@ if __name__ == "__main__":
     if args.mode == 'train':
         train_model()
     else:
-        uvicorn.run(app, host="localhost", port=8000)
+        # Changed to 0.0.0.0 and grabs dynamic port for cloud hosting like Render
+        port = int(os.environ.get("PORT", 8000))
+        uvicorn.run(app, host="0.0.0.0", port=port)
