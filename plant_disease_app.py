@@ -6,7 +6,7 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import argparse
 import numpy as np
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageOps
 import tensorflow as tf
 from tensorflow.keras import models, layers
 import uvicorn
@@ -17,14 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 BATCH_SIZE = 32
 IMAGE_SIZE = 256
 CHANNELS = 3
-EPOCHS = 15 # Lowered slightly because MobileNetV2 learns much faster
+EPOCHS = 15
 MODEL_PATH = "plant_disease_model.keras"
 DATASET_DIR = "dataset"
-CONFIDENCE_THRESHOLD = 0.40 # Rejects random background photos
+CONFIDENCE_THRESHOLD = 0.40
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
 DISEASE_KNOWLEDGE_BASE = {
-    # --- POTATO CLASSES ---
     "Potato___Early_blight": {
         "description": "Early blight is a common fungal disease characterized by dark, concentric rings on older leaves.",
         "treatment": [
@@ -56,8 +55,6 @@ DISEASE_KNOWLEDGE_BASE = {
         "treatment": ["No treatment needed."],
         "prevention": ["Maintain consistent watering.", "Keep area weed-free."]
     },
-
-    # --- TOMATO CLASSES ---
     "Tomato_Bacterial_spot": {
         "description": "Bacterial spot causes small, water-soaked spots on leaves that turn brown/black.",
         "treatment": [
@@ -163,8 +160,6 @@ DISEASE_KNOWLEDGE_BASE = {
         "treatment": ["No treatment needed."],
         "prevention": ["Maintain regular care routine."]
     },
-
-    # Fallback
     "default": {
         "description": "Disease detected, but specific advice is missing for this class.",
         "treatment": ["Consult a local agricultural expert."],
@@ -188,30 +183,26 @@ def get_solution(class_name):
 def build_model(num_classes):
     print("Building MobileNetV2 Transfer Learning Model...")
     
-    # AGGRESSIVE AUGMENTATION: Forces the AI to ignore the background
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
-        layers.RandomRotation(0.3), # Rotate up to 30%
-        layers.RandomZoom(0.3),     # Zoom in/out up to 30%
+        layers.RandomRotation(0.3), 
+        layers.RandomZoom(0.3),     
         layers.RandomContrast(0.2),
-        layers.RandomTranslation(height_factor=0.2, width_factor=0.2), # Shift image off-center
+        layers.RandomTranslation(height_factor=0.2, width_factor=0.2), 
     ])
 
     input_shape = (IMAGE_SIZE, IMAGE_SIZE, CHANNELS)
 
-    # Load Google's pre-trained MobileNetV2
     base_model = tf.keras.applications.MobileNetV2(
         input_shape=input_shape,
         include_top=False,
         weights='imagenet'
     )
-    # Freeze the base model so we don't destroy its pre-existing knowledge
     base_model.trainable = False
 
     model = models.Sequential([
         layers.Input(shape=input_shape),
         data_augmentation,
-        # MobileNetV2 requires pixel values between -1 and 1
         layers.Rescaling(1./127.5, offset=-1),
         base_model,
         layers.GlobalAveragePooling2D(),
@@ -231,7 +222,6 @@ def build_model(num_classes):
 def train_model():
     if not os.path.exists(DATASET_DIR):
         print(f"Error: Dataset directory '{DATASET_DIR}' not found.")
-        print("Please structure data as: dataset/ClassName/image.jpg")
         return
 
     print("Loading dataset...")
@@ -265,7 +255,6 @@ def train_model():
     model = build_model(len(class_names))
     
     print("Starting training...")
-    # Added Early Stopping so it stops automatically if it stops improving
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=1, callbacks=[early_stopping])
 
@@ -277,7 +266,7 @@ def train_model():
     print("Training complete!")
 
 # --- FASTAPI BACKEND ---
-app = FastAPI(title="Plant Disease Detection API")
+app = FastAPI(title="Plant Doctor AI API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -301,9 +290,29 @@ def load_inference_model():
     else:
         print("WARNING: Model not found. API will run in MOCK mode.")
 
+# --- NEW: REAL WORLD IMAGE PREPROCESSING ---
+def process_wild_image(image: Image.Image) -> np.ndarray:
+    """Preprocesses real-world phone photos to match the training dataset conditions."""
+    
+    # 1. AUTO-CONTRAST (Fixes harsh sunlight and shadows)
+    image = ImageOps.autocontrast(image, cutoff=2)
+    
+    # 2. CENTER CROP (Removes fingers, dirt, and sky from the edges)
+    width, height = image.size
+    left = width * 0.15
+    top = height * 0.15
+    right = width * 0.85
+    bottom = height * 0.85
+    image = image.crop((left, top, right, bottom))
+    
+    # 3. RESIZE (Squash it to 256x256)
+    image = image.resize((IMAGE_SIZE, IMAGE_SIZE))
+    
+    return np.array(image)
+
 def read_file_as_image(data) -> np.ndarray:
-    image = np.array(Image.open(BytesIO(data)).convert("RGB"))
-    return image
+    image = Image.open(BytesIO(data)).convert("RGB")
+    return process_wild_image(image)
 
 @app.on_event("startup")
 async def startup_event():
@@ -311,7 +320,7 @@ async def startup_event():
 
 @app.get("/")
 async def ping():
-    return "Plant Disease Detection API is running"
+    return "Plant Doctor AI is running"
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
@@ -322,8 +331,7 @@ async def predict(file: UploadFile = File(...)):
     
     if MODEL:
         img_tensor = tf.convert_to_tensor(image)
-        img_resized = tf.image.resize(img_tensor, [IMAGE_SIZE, IMAGE_SIZE])
-        img_batch = tf.expand_dims(img_resized, 0)
+        img_batch = tf.expand_dims(img_tensor, 0)
         predictions = MODEL.predict(img_batch)
         predicted_class = LOADED_CLASSES[np.argmax(predictions[0])]
         confidence = float(np.max(predictions[0]))
@@ -335,7 +343,6 @@ async def predict(file: UploadFile = File(...)):
         confidence = random.uniform(0.7, 0.99)
         status = "MOCK_RESPONSE (Train model to get real results)"
 
-    # Filter out low-confidence guesses
     if confidence < CONFIDENCE_THRESHOLD:
         return {
             "class": "Unknown / Unclear Image",
@@ -343,7 +350,7 @@ async def predict(file: UploadFile = File(...)):
             "status": "Low Confidence",
             "solutions": {
                 "description": "The AI is not confident enough to make a diagnosis. Ensure the leaf is well-lit and in focus.",
-                "treatment": ["Try capturing the leaf with a plain background (like a white piece of paper)."],
+                "treatment": ["Try capturing the leaf with a plain background (like a white piece of paper) or getting closer."],
                 "prevention": ["Ensure the photo is not blurry."]
             }
         }
@@ -365,6 +372,5 @@ if __name__ == "__main__":
     if args.mode == 'train':
         train_model()
     else:
-        # Changed to 0.0.0.0 and grabs dynamic port for cloud hosting like Render
         port = int(os.environ.get("PORT", 8000))
         uvicorn.run(app, host="0.0.0.0", port=port)
