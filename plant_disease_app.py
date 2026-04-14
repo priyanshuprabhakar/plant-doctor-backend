@@ -1,6 +1,5 @@
 import os
 # --- FIX FOR MEMORY ERROR ---
-# This disables Intel's oneDNN optimizations which cause "could not create a memory object" on some CPUs.
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import argparse
@@ -17,10 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 BATCH_SIZE = 32
 IMAGE_SIZE = 256
 CHANNELS = 3
-EPOCHS = 15
+EPOCHS = 20 # Increased slightly for Fine-Tuning
 MODEL_PATH = "plant_disease_model.keras"
 DATASET_DIR = "dataset"
-CONFIDENCE_THRESHOLD = 0.40
+CONFIDENCE_THRESHOLD = 0.70
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
 DISEASE_KNOWLEDGE_BASE = {
@@ -178,10 +177,33 @@ def get_solution(class_name):
             return val
     return DISEASE_KNOWLEDGE_BASE["default"]
 
+# --- REAL WORLD IMAGE PREPROCESSING ---
+def process_wild_image(image: Image.Image) -> np.ndarray:
+    """Preprocesses real-world phone photos to match the training dataset conditions."""
+    
+    # 1. AUTO-CONTRAST (Fixes harsh sunlight and shadows)
+    image = ImageOps.autocontrast(image, cutoff=2)
+    
+    # 2. CENTER CROP (Removes fingers, dirt, and sky from the edges)
+    width, height = image.size
+    left = width * 0.15
+    top = height * 0.15
+    right = width * 0.85
+    bottom = height * 0.85
+    image = image.crop((left, top, right, bottom))
+    
+    # 3. RESIZE (Squash it to 256x256)
+    image = image.resize((IMAGE_SIZE, IMAGE_SIZE))
+    
+    return np.array(image)
 
-# --- UPGRADED MODEL ARCHITECTURE (MobileNetV2) ---
+def read_file_as_image(data) -> np.ndarray:
+    image = Image.open(BytesIO(data)).convert("RGB")
+    return process_wild_image(image)
+
+# --- ADVANCED MODEL ARCHITECTURE (EfficientNet + Fine-Tuning) ---
 def build_model(num_classes):
-    print("Building MobileNetV2 Transfer Learning Model...")
+    print("Building Advanced EfficientNetB0 Model...")
     
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
@@ -193,26 +215,31 @@ def build_model(num_classes):
 
     input_shape = (IMAGE_SIZE, IMAGE_SIZE, CHANNELS)
 
-    base_model = tf.keras.applications.MobileNetV2(
+    # EfficientNet handles pixel rescaling internally, no manual Rescaling layer needed.
+    base_model = tf.keras.applications.EfficientNetB0(
         input_shape=input_shape,
         include_top=False,
         weights='imagenet'
     )
-    base_model.trainable = False
+    
+    # FINE-TUNING: Unfreeze the top 20 layers
+    base_model.trainable = True
+    for layer in base_model.layers[:-20]:
+        layer.trainable = False
 
     model = models.Sequential([
         layers.Input(shape=input_shape),
         data_augmentation,
-        layers.Rescaling(1./127.5, offset=-1),
         base_model,
         layers.GlobalAveragePooling2D(),
-        layers.Dense(128, activation='relu'),
+        layers.Dense(256, activation='relu'), 
         layers.Dropout(0.5), 
         layers.Dense(num_classes, activation='softmax')
     ])
 
+    # CRITICAL: Tiny learning rate prevents destroying pre-trained knowledge
     model.compile(
-        optimizer='adam',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
         loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
         metrics=['accuracy']
     )
@@ -289,30 +316,6 @@ def load_inference_model():
         print(f"Model loaded. Classes: {LOADED_CLASSES}")
     else:
         print("WARNING: Model not found. API will run in MOCK mode.")
-
-# --- NEW: REAL WORLD IMAGE PREPROCESSING ---
-def process_wild_image(image: Image.Image) -> np.ndarray:
-    """Preprocesses real-world phone photos to match the training dataset conditions."""
-    
-    # 1. AUTO-CONTRAST (Fixes harsh sunlight and shadows)
-    image = ImageOps.autocontrast(image, cutoff=2)
-    
-    # 2. CENTER CROP (Removes fingers, dirt, and sky from the edges)
-    width, height = image.size
-    left = width * 0.15
-    top = height * 0.15
-    right = width * 0.85
-    bottom = height * 0.85
-    image = image.crop((left, top, right, bottom))
-    
-    # 3. RESIZE (Squash it to 256x256)
-    image = image.resize((IMAGE_SIZE, IMAGE_SIZE))
-    
-    return np.array(image)
-
-def read_file_as_image(data) -> np.ndarray:
-    image = Image.open(BytesIO(data)).convert("RGB")
-    return process_wild_image(image)
 
 @app.on_event("startup")
 async def startup_event():
