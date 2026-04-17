@@ -177,23 +177,18 @@ def get_solution(class_name):
             return val
     return DISEASE_KNOWLEDGE_BASE["default"]
 
-# --- REAL WORLD IMAGE PREPROCESSING ---
+# --- UPGRADED REAL WORLD IMAGE PREPROCESSING ---
 def process_wild_image(image: Image.Image) -> np.ndarray:
     """Preprocesses real-world phone photos to match the training dataset conditions."""
     
     # 1. AUTO-CONTRAST (Fixes harsh sunlight and shadows)
     image = ImageOps.autocontrast(image, cutoff=2)
     
-    # 2. CENTER CROP (Removes fingers, dirt, and sky from the edges)
-    width, height = image.size
-    left = width * 0.15
-    top = height * 0.15
-    right = width * 0.85
-    bottom = height * 0.85
-    image = image.crop((left, top, right, bottom))
-    
-    # 3. RESIZE (Squash it to 256x256)
-    image = image.resize((IMAGE_SIZE, IMAGE_SIZE))
+    # 2. SMART SQUARE CROP & RESIZE (The Magic Fix)
+    # Instead of squashing a tall phone photo into a square, ImageOps.fit 
+    # perfectly crops the center into a square FIRST, then scales it down.
+    # This keeps the leaf's geometry and disease spot shapes 100% accurate.
+    image = ImageOps.fit(image, (IMAGE_SIZE, IMAGE_SIZE), method=Image.Resampling.LANCZOS)
     
     return np.array(image)
 
