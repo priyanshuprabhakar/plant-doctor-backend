@@ -13,7 +13,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 IMAGE_SIZE = 256
 CHANNELS = 3
 EPOCHS = 20 # Increased slightly for Fine-Tuning
@@ -269,9 +269,11 @@ def train_model():
         return train_ds, val_ds, test_ds
 
     train_ds, val_ds, test_ds = get_dataset_partitions_tf(dataset)
-    train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=tf.data.AUTOTUNE)
-    val_ds = val_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
-    test_ds = test_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
+    
+    # DYNAMIC BUFFER with STRICT SPEED LIMITS to protect Windows I/O
+    train_ds = train_ds.shuffle(buffer_size=len(train_ds)).prefetch(buffer_size=2)
+    val_ds = val_ds.prefetch(buffer_size=2)
+    test_ds = test_ds.prefetch(buffer_size=2)
 
     print("Building model...")
     model = build_model(len(class_names))
