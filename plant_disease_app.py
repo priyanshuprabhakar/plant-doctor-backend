@@ -9,45 +9,29 @@ from PIL import Image, ImageOps
 import tensorflow as tf
 from tensorflow.keras import models, layers
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 16
+BATCH_SIZE = 16 # Lowered to prevent Windows I/O crash
 IMAGE_SIZE = 256
 CHANNELS = 3
-EPOCHS = 20 # Increased slightly for Fine-Tuning
+EPOCHS = 20
 MODEL_PATH = "plant_disease_model.keras"
 DATASET_DIR = "dataset"
-CONFIDENCE_THRESHOLD = 0.70
+CONFIDENCE_THRESHOLD = 0.70 # User defined strict threshold
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
 DISEASE_KNOWLEDGE_BASE = {
     "Potato___Early_blight": {
         "description": "Early blight is a common fungal disease characterized by dark, concentric rings on older leaves.",
-        "treatment": [
-            "Apply copper-based fungicides (mancozeb, chlorothalonil).",
-            "Remove infected leaves immediately.",
-            "Improve air circulation."
-        ],
-        "prevention": [
-            "Rotate crops every 2-3 years.",
-            "Use drip irrigation to keep foliage dry.",
-            "Plant resistant varieties."
-        ]
+        "treatment": ["Apply copper-based fungicides.", "Remove infected leaves immediately."],
+        "prevention": ["Rotate crops every 2-3 years.", "Use drip irrigation."]
     },
     "Potato___Late_blight": {
         "description": "Late blight is a serious water mold disease causing dark lesions and white fungal growth.",
-        "treatment": [
-            "Apply systemic fungicides like metalaxyl.",
-            "Destroy infected plants immediately.",
-            "Harvest tubers only after vines die."
-        ],
-        "prevention": [
-            "Eliminate cull piles.",
-            "Use certified disease-free seeds.",
-            "Monitor cool, wet weather."
-        ]
+        "treatment": ["Apply systemic fungicides like metalaxyl.", "Destroy infected plants immediately."],
+        "prevention": ["Eliminate cull piles.", "Use certified disease-free seeds."]
     },
     "Potato___Healthy": {
         "description": "The plant appears healthy.",
@@ -56,103 +40,48 @@ DISEASE_KNOWLEDGE_BASE = {
     },
     "Tomato_Bacterial_spot": {
         "description": "Bacterial spot causes small, water-soaked spots on leaves that turn brown/black.",
-        "treatment": [
-            "Apply copper sprays or streptomycin.",
-            "Remove infected plant debris."
-        ],
-        "prevention": [
-            "Use disease-free seeds.",
-            "Avoid overhead irrigation.",
-            "Rotate with non-solanaceous crops."
-        ]
+        "treatment": ["Apply copper sprays or streptomycin.", "Remove infected plant debris."],
+        "prevention": ["Use disease-free seeds.", "Avoid overhead irrigation."]
     },
     "Tomato_Early_blight": {
         "description": "Fungal disease causing 'bullseye' pattern spots on lower leaves.",
-        "treatment": [
-            "Apply fungicides (Chlorothalonil or Copper).",
-            "Stake plants to improve airflow."
-        ],
-        "prevention": [
-            "Mulch soil to prevent splash-back.",
-            "Rotate crops yearly."
-        ]
+        "treatment": ["Apply fungicides (Chlorothalonil or Copper).", "Stake plants to improve airflow."],
+        "prevention": ["Mulch soil to prevent splash-back.", "Rotate crops yearly."]
     },
     "Tomato_Late_blight": {
         "description": "A destructive disease causing large, dark, greasy-looking blotches on leaves and stems.",
-        "treatment": [
-            "Apply fungicides immediately (chlorothalonil).",
-            "Remove and destroy plants if severe."
-        ],
-        "prevention": [
-            "Plant resistant varieties.",
-            "Keep foliage dry."
-        ]
+        "treatment": ["Apply fungicides immediately.", "Remove and destroy plants if severe."],
+        "prevention": ["Plant resistant varieties.", "Keep foliage dry."]
     },
     "Tomato_Leaf_Mold": {
         "description": "Fungal disease causing pale green/yellow spots on upper leaves and gray mold underneath.",
-        "treatment": [
-            "Apply fungicides.",
-            "Increase spacing for ventilation."
-        ],
-        "prevention": [
-            "Avoid wetting leaves.",
-            "Sanitize greenhouse tools."
-        ]
+        "treatment": ["Apply fungicides.", "Increase spacing for ventilation."],
+        "prevention": ["Avoid wetting leaves.", "Sanitize greenhouse tools."]
     },
     "Tomato_Septoria_leaf_spot": {
         "description": "Causes numerous small, circular spots with dark borders and light centers.",
-        "treatment": [
-            "Remove lower infected leaves.",
-            "Apply fungicide."
-        ],
-        "prevention": [
-            "Remove crop debris.",
-            "Mulch around base of plants."
-        ]
+        "treatment": ["Remove lower infected leaves.", "Apply fungicide."],
+        "prevention": ["Remove crop debris.", "Mulch around base of plants."]
     },
     "Tomato_Spider_mites_Two_spotted_spider_mite": {
         "description": "Tiny pests that cause yellow stippling on leaves and fine webbing.",
-        "treatment": [
-            "Apply insecticidal soap or neem oil.",
-            "Introduce predatory mites."
-        ],
-        "prevention": [
-            "Keep plants well-watered (mites love dry heat).",
-            "Dust off leaves regularly."
-        ]
+        "treatment": ["Apply insecticidal soap or neem oil.", "Introduce predatory mites."],
+        "prevention": ["Keep plants well-watered.", "Dust off leaves regularly."]
     },
     "Tomato__Target_Spot": {
         "description": "Fungal disease causing brown, necrotic lesions with concentric rings.",
-        "treatment": [
-            "Apply fungicides (azoxystrobin).",
-            "Remove infected leaves."
-        ],
-        "prevention": [
-            "Ensure good airflow.",
-            "Practice crop rotation."
-        ]
+        "treatment": ["Apply fungicides (azoxystrobin).", "Remove infected leaves."],
+        "prevention": ["Ensure good airflow.", "Practice crop rotation."]
     },
     "Tomato__Tomato_YellowLeaf__Curl_Virus": {
         "description": "Viral disease transmitted by whiteflies causing upward curling and yellowing leaves.",
-        "treatment": [
-            "No cure for infected plants; remove them.",
-            "Control whitefly populations."
-        ],
-        "prevention": [
-            "Use reflective mulch.",
-            "Use virus-resistant varieties."
-        ]
+        "treatment": ["No cure for infected plants; remove them.", "Control whitefly populations."],
+        "prevention": ["Use reflective mulch.", "Use virus-resistant varieties."]
     },
     "Tomato__Tomato_mosaic_virus": {
         "description": "Viral disease causing mottled, mosaic patterns on leaves.",
-        "treatment": [
-            "Remove and destroy infected plants.",
-            "Disinfect tools (virus is highly contagious)."
-        ],
-        "prevention": [
-            "Wash hands before handling plants.",
-            "Avoid using tobacco products near plants."
-        ]
+        "treatment": ["Remove and destroy infected plants.", "Disinfect tools."],
+        "prevention": ["Wash hands before handling plants.", "Avoid using tobacco products near plants."]
     },
     "Tomato_healthy": {
         "description": "The tomato plant appears healthy.",
@@ -168,7 +97,6 @@ DISEASE_KNOWLEDGE_BASE = {
 
 # --- SMART MATCHER ---
 def get_solution(class_name):
-    """Ignores spaces and underscores to guarantee a match."""
     def normalize(text):
         return "".join(e for e in text if e.isalnum()).lower()
     target = normalize(class_name)
@@ -177,29 +105,20 @@ def get_solution(class_name):
             return val
     return DISEASE_KNOWLEDGE_BASE["default"]
 
-# --- UPGRADED REAL WORLD IMAGE PREPROCESSING ---
+# --- REAL WORLD IMAGE PREPROCESSING ---
 def process_wild_image(image: Image.Image) -> np.ndarray:
-    """Preprocesses real-world phone photos to match the training dataset conditions."""
-    
-    # 1. AUTO-CONTRAST (Fixes harsh sunlight and shadows)
     image = ImageOps.autocontrast(image, cutoff=2)
-    
-    # 2. SMART SQUARE CROP & RESIZE (The Magic Fix)
-    # Instead of squashing a tall phone photo into a square, ImageOps.fit 
-    # perfectly crops the center into a square FIRST, then scales it down.
-    # This keeps the leaf's geometry and disease spot shapes 100% accurate.
+    # Smart Square Crop & Resize
     image = ImageOps.fit(image, (IMAGE_SIZE, IMAGE_SIZE), method=Image.Resampling.LANCZOS)
-    
     return np.array(image)
 
 def read_file_as_image(data) -> np.ndarray:
     image = Image.open(BytesIO(data)).convert("RGB")
     return process_wild_image(image)
 
-# --- ADVANCED MODEL ARCHITECTURE (EfficientNet + Fine-Tuning) ---
+# --- ADVANCED MODEL ARCHITECTURE ---
 def build_model(num_classes):
     print("Building Advanced EfficientNetB0 Model...")
-    
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
         layers.RandomRotation(0.3), 
@@ -207,17 +126,10 @@ def build_model(num_classes):
         layers.RandomContrast(0.2),
         layers.RandomTranslation(height_factor=0.2, width_factor=0.2), 
     ])
-
     input_shape = (IMAGE_SIZE, IMAGE_SIZE, CHANNELS)
-
-    # EfficientNet handles pixel rescaling internally, no manual Rescaling layer needed.
-    base_model = tf.keras.applications.EfficientNetB0(
-        input_shape=input_shape,
-        include_top=False,
-        weights='imagenet'
-    )
+    base_model = tf.keras.applications.EfficientNetB0(input_shape=input_shape, include_top=False, weights='imagenet')
     
-    # FINE-TUNING: Unfreeze the top 20 layers
+    # FINE-TUNING
     base_model.trainable = True
     for layer in base_model.layers[:-20]:
         layer.trainable = False
@@ -231,8 +143,6 @@ def build_model(num_classes):
         layers.Dropout(0.5), 
         layers.Dense(num_classes, activation='softmax')
     ])
-
-    # CRITICAL: Tiny learning rate prevents destroying pre-trained knowledge
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
         loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
@@ -248,12 +158,8 @@ def train_model():
 
     print("Loading dataset...")
     dataset = tf.keras.preprocessing.image_dataset_from_directory(
-        DATASET_DIR,
-        shuffle=True,
-        image_size=(IMAGE_SIZE, IMAGE_SIZE),
-        batch_size=BATCH_SIZE
+        DATASET_DIR, shuffle=True, image_size=(IMAGE_SIZE, IMAGE_SIZE), batch_size=BATCH_SIZE
     )
-
     class_names = dataset.class_names
     print(f"Classes found: {class_names}")
 
@@ -263,42 +169,30 @@ def train_model():
             ds = ds.shuffle(shuffle_size, seed=12)
         train_size = int(train_split * ds_size)
         val_size = int(val_split * ds_size)
-        train_ds = ds.take(train_size)
-        val_ds = ds.skip(train_size).take(val_size)
-        test_ds = ds.skip(train_size).skip(val_size)
-        return train_ds, val_ds, test_ds
+        return ds.take(train_size), ds.skip(train_size).take(val_size), ds.skip(train_size).skip(val_size)
 
     train_ds, val_ds, test_ds = get_dataset_partitions_tf(dataset)
     
-    # DYNAMIC BUFFER with STRICT SPEED LIMITS to protect Windows I/O
+    # DYNAMIC BUFFER with SPEED LIMITS for Windows
     train_ds = train_ds.shuffle(buffer_size=len(train_ds)).prefetch(buffer_size=2)
     val_ds = val_ds.prefetch(buffer_size=2)
     test_ds = test_ds.prefetch(buffer_size=2)
 
     print("Building model...")
     model = build_model(len(class_names))
-    
     print("Starting training...")
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
     model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS, verbose=1, callbacks=[early_stopping])
 
     print(f"Saving model to {MODEL_PATH}...")
     model.save(MODEL_PATH)
-    
     with open("class_names.txt", "w") as f:
         f.write("\n".join(class_names))
     print("Training complete!")
 
 # --- FASTAPI BACKEND ---
 app = FastAPI(title="Plant Doctor AI API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 MODEL = None
 LOADED_CLASSES = []
@@ -310,9 +204,9 @@ def load_inference_model():
         MODEL = models.load_model(MODEL_PATH)
         with open("class_names.txt", "r") as f:
             LOADED_CLASSES = [line.strip() for line in f.readlines()]
-        print(f"Model loaded. Classes: {LOADED_CLASSES}")
+        print("Model loaded.")
     else:
-        print("WARNING: Model not found. API will run in MOCK mode.")
+        print("WARNING: Model not found.")
 
 @app.on_event("startup")
 async def startup_event():
@@ -323,7 +217,7 @@ async def ping():
     return "Plant Doctor AI is running"
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
     if not file:
         raise HTTPException(status_code=400, detail="No file uploaded")
     
@@ -338,22 +232,36 @@ async def predict(file: UploadFile = File(...)):
         status = "Real Model Prediction"
     else:
         import random
-        mock_classes = ["Tomato___Early_blight", "Potato___Early_blight", "Tomato___Healthy"]
-        predicted_class = random.choice(mock_classes)
-        confidence = random.uniform(0.7, 0.99)
-        status = "MOCK_RESPONSE (Train model to get real results)"
+        predicted_class = "Tomato___Early_blight"
+        confidence = 0.99
+        status = "MOCK_RESPONSE"
 
+    # Strict Confidence Check
     if confidence < CONFIDENCE_THRESHOLD:
         return {
             "class": "Unknown / Unclear Image",
             "confidence": confidence,
             "status": "Low Confidence",
             "solutions": {
-                "description": "The AI is not confident enough to make a diagnosis. Ensure the leaf is well-lit and in focus.",
-                "treatment": ["Try capturing the leaf with a plain background (like a white piece of paper) or getting closer."],
-                "prevention": ["Ensure the photo is not blurry."]
+                "description": "The AI is not confident enough. Please get closer and ensure the leaf is in focus.",
+                "treatment": ["Take a new photo closer to the leaf."],
+                "prevention": ["Avoid blurry or heavily shadowed photos."]
             }
         }
+
+    # UI Dropdown Validation
+    if plant_type != "auto":
+        if plant_type.lower() not in predicted_class.lower():
+            return {
+                "class": "Plant Mismatch Error",
+                "confidence": 0.0,
+                "status": "Error",
+                "solutions": {
+                    "description": f"You selected '{plant_type.capitalize()}', but the AI thinks this is a '{predicted_class.split('_')[0]}'.",
+                    "treatment": ["Ensure you selected the correct crop from the dropdown."],
+                    "prevention": ["If this is correct, the image might be too confusing for the AI."]
+                }
+            }
 
     solutions = get_solution(predicted_class)
 
@@ -368,7 +276,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='serve', choices=['train', 'serve'])
     args = parser.parse_args()
-    
     if args.mode == 'train':
         train_model()
     else:
