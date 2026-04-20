@@ -226,13 +226,30 @@ async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
     if MODEL:
         img_tensor = tf.convert_to_tensor(image)
         img_batch = tf.expand_dims(img_tensor, 0)
-        predictions = MODEL.predict(img_batch)
-        predicted_class = LOADED_CLASSES[np.argmax(predictions[0])]
-        confidence = float(np.max(predictions[0]))
+        
+        # Get the raw array of probabilities for all 13 classes
+        predictions = MODEL.predict(img_batch)[0]
+        
+        # --- THE MAGIC FIX: PROBABILITY MASKING ---
+        if plant_type != "auto":
+            # Loop through all classes. If it doesn't match the user's dropdown, set it to 0%
+            for i, class_name in enumerate(LOADED_CLASSES):
+                if plant_type.lower() not in class_name.lower():
+                    predictions[i] = 0.0 
+            
+            # Re-normalize the math so the remaining options add back up to 100%
+            total_prob = np.sum(predictions)
+            if total_prob > 0:
+                predictions = predictions / total_prob
+        # ------------------------------------------
+
+        # Now pick the highest probability from the filtered list
+        predicted_class = LOADED_CLASSES[np.argmax(predictions)]
+        confidence = float(np.max(predictions))
         status = "Real Model Prediction"
     else:
         import random
-        predicted_class = "Tomato___Early_blight"
+        predicted_class = "Potato___Early_blight"
         confidence = 0.99
         status = "MOCK_RESPONSE"
 
@@ -248,20 +265,6 @@ async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
                 "prevention": ["Avoid blurry or heavily shadowed photos."]
             }
         }
-
-    # UI Dropdown Validation
-    if plant_type != "auto":
-        if plant_type.lower() not in predicted_class.lower():
-            return {
-                "class": "Plant Mismatch Error",
-                "confidence": 0.0,
-                "status": "Error",
-                "solutions": {
-                    "description": f"You selected '{plant_type.capitalize()}', but the AI thinks this is a '{predicted_class.split('_')[0]}'.",
-                    "treatment": ["Ensure you selected the correct crop from the dropdown."],
-                    "prevention": ["If this is correct, the image might be too confusing for the AI."]
-                }
-            }
 
     solutions = get_solution(predicted_class)
 
