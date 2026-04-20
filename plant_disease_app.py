@@ -227,20 +227,40 @@ async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
         img_tensor = tf.convert_to_tensor(image)
         img_batch = tf.expand_dims(img_tensor, 0)
         
-        # Get the raw array of probabilities for all 13 classes
-        predictions = MODEL.predict(img_batch)[0]
+        # Get raw probabilities
+        raw_predictions = MODEL.predict(img_batch)[0]
         
-        # --- THE MAGIC FIX: PROBABILITY MASKING ---
+        # Determine the AI's absolute top choice BEFORE masking
+        raw_top_index = np.argmax(raw_predictions)
+        raw_top_class = LOADED_CLASSES[raw_top_index]
+        raw_confidence = float(raw_predictions[raw_top_index])
+        
+        # --- HYBRID MASKING LOGIC ---
         if plant_type != "auto":
-            # Loop through all classes. If it doesn't match the user's dropdown, set it to 0%
+            # Check if the user made a blatant mistake (AI is >80% sure it's a different plant)
+            if plant_type.lower() not in raw_top_class.lower() and raw_confidence > 0.80:
+                 return {
+                    "class": "Plant Mismatch Detected",
+                    "confidence": raw_confidence,
+                    "status": "Error",
+                    "solutions": {
+                        "description": f"You selected {plant_type.capitalize()}, but the AI is highly confident this is a {raw_top_class.split('_')[0]} leaf.",
+                        "treatment": ["Please check your dropdown selection or ensure you are scanning the correct plant."],
+                        "prevention": ["Use 'Auto-Detect' if you are unsure of the plant species."]
+                    }
+                }
+            
+            # If the AI is unsure, trust the user and apply the mask
+            predictions = np.copy(raw_predictions)
             for i, class_name in enumerate(LOADED_CLASSES):
                 if plant_type.lower() not in class_name.lower():
                     predictions[i] = 0.0 
             
-            # Re-normalize the math so the remaining options add back up to 100%
             total_prob = np.sum(predictions)
             if total_prob > 0:
                 predictions = predictions / total_prob
+        else:
+            predictions = raw_predictions
         # ------------------------------------------
 
         # Now pick the highest probability from the filtered list
