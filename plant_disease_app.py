@@ -2,9 +2,11 @@ import os
 # --- FIX FOR MEMORY ERROR ---
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
+import random
 import argparse
 import numpy as np
 from io import BytesIO
+from contextlib import asynccontextmanager
 from PIL import Image, ImageOps
 import tensorflow as tf
 from tensorflow.keras import models, layers
@@ -13,13 +15,17 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 16 # Lowered to prevent Windows I/O crash
+BATCH_SIZE = 16  # Lowered to prevent Windows I/O crash
 IMAGE_SIZE = 256
 CHANNELS = 3
 EPOCHS = 20
-MODEL_PATH = "plant_disease_model.keras"
-DATASET_DIR = "dataset"
-CONFIDENCE_THRESHOLD = 0.70 # User defined strict threshold
+MODEL_PATH = os.environ.get("MODEL_PATH", "plant_disease_model.keras")
+DATASET_DIR = os.environ.get("DATASET_DIR", "dataset")
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
+MISMATCH_THRESHOLD = float(os.environ.get("MISMATCH_THRESHOLD", "0.88"))  # FIX: was 0.50, too aggressive
+
+# Valid plant types accepted by the API
+VALID_PLANT_TYPES = {"auto", "potato", "tomato"}
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
 DISEASE_KNOWLEDGE_BASE = {
@@ -108,28 +114,32 @@ def get_solution(class_name):
 # --- REAL WORLD IMAGE PREPROCESSING ---
 def process_wild_image(image: Image.Image) -> np.ndarray:
     image = ImageOps.autocontrast(image, cutoff=2)
-    # Smart Square Crop & Resize
+    # Smart square crop & resize
     image = ImageOps.fit(image, (IMAGE_SIZE, IMAGE_SIZE), method=Image.Resampling.LANCZOS)
     return np.array(image)
 
 def read_file_as_image(data) -> np.ndarray:
-    image = Image.open(BytesIO(data)).convert("RGB")
-    return process_wild_image(image)
+    # FIX: wrapped in try/except to handle corrupt or non-image files gracefully
+    try:
+        image = Image.open(BytesIO(data)).convert("RGB")
+        return process_wild_image(image)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read image file. Please upload a valid image (JPG, PNG, etc).")
 
 # --- ADVANCED MODEL ARCHITECTURE ---
 def build_model(num_classes):
     print("Building Advanced EfficientNetB0 Model...")
     data_augmentation = tf.keras.Sequential([
         layers.RandomFlip("horizontal_and_vertical"),
-        layers.RandomRotation(0.3), 
-        layers.RandomZoom(0.3),     
+        layers.RandomRotation(0.3),
+        layers.RandomZoom(0.3),
         layers.RandomContrast(0.2),
-        layers.RandomTranslation(height_factor=0.2, width_factor=0.2), 
+        layers.RandomTranslation(height_factor=0.2, width_factor=0.2),
     ])
     input_shape = (IMAGE_SIZE, IMAGE_SIZE, CHANNELS)
     base_model = tf.keras.applications.EfficientNetB0(input_shape=input_shape, include_top=False, weights='imagenet')
-    
-    # FINE-TUNING
+
+    # Fine-tuning: freeze all but last 20 layers
     base_model.trainable = True
     for layer in base_model.layers[:-20]:
         layer.trainable = False
@@ -139,8 +149,8 @@ def build_model(num_classes):
         data_augmentation,
         base_model,
         layers.GlobalAveragePooling2D(),
-        layers.Dense(256, activation='relu'), 
-        layers.Dropout(0.5), 
+        layers.Dense(256, activation='relu'),
+        layers.Dropout(0.5),
         layers.Dense(num_classes, activation='softmax')
     ])
     model.compile(
@@ -172,8 +182,8 @@ def train_model():
         return ds.take(train_size), ds.skip(train_size).take(val_size), ds.skip(train_size).skip(val_size)
 
     train_ds, val_ds, test_ds = get_dataset_partitions_tf(dataset)
-    
-    # DYNAMIC BUFFER with SPEED LIMITS for Windows
+
+    # Dynamic buffer with speed limits for Windows
     train_ds = train_ds.shuffle(buffer_size=len(train_ds)).prefetch(buffer_size=2)
     val_ds = val_ds.prefetch(buffer_size=2)
     test_ds = test_ds.prefetch(buffer_size=2)
@@ -191,95 +201,115 @@ def train_model():
     print("Training complete!")
 
 # --- FASTAPI BACKEND ---
-app = FastAPI(title="Plant Doctor AI API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-MODEL = None
-LOADED_CLASSES = []
+# FIX: Use modern lifespan context manager instead of deprecated @app.on_event("startup")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_inference_model()
+    yield
 
+app = FastAPI(title="Plant Doctor AI API", lifespan=lifespan)
+
+# FIX: Restrict CORS origins in production — replace "*" with your frontend domain when deploying
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # TODO: Change to your domain before going live, e.g. ["https://yourapp.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# FIX: Use app.state instead of bare globals for model storage
 def load_inference_model():
-    global MODEL, LOADED_CLASSES
     if os.path.exists(MODEL_PATH) and os.path.exists("class_names.txt"):
         print("Loading trained model...")
-        MODEL = models.load_model(MODEL_PATH)
+        app.state.model = models.load_model(MODEL_PATH)
         with open("class_names.txt", "r") as f:
-            LOADED_CLASSES = [line.strip() for line in f.readlines()]
-        print("Model loaded.")
+            app.state.class_names = [line.strip() for line in f.readlines()]
+        print("Model loaded successfully.")
     else:
-        print("WARNING: Model not found.")
-
-@app.on_event("startup")
-async def startup_event():
-    load_inference_model()
+        print("WARNING: Model not found. Run with --mode train first.")
+        app.state.model = None
+        app.state.class_names = []
 
 @app.get("/")
 async def ping():
-    return "Plant Doctor AI is running"
+    return {"status": "Plant Doctor AI is running", "model_loaded": app.state.model is not None}
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
+    # FIX: Validate plant_type against allowed values
+    if plant_type.lower() not in VALID_PLANT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid plant_type '{plant_type}'. Must be one of: {', '.join(VALID_PLANT_TYPES)}"
+        )
+
     if not file:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    # FIX: read_file_as_image now raises HTTPException on corrupt files
     image = read_file_as_image(await file.read())
-    
-    if MODEL:
-        img_tensor = tf.convert_to_tensor(image)
-        img_batch = tf.expand_dims(img_tensor, 0)
-        
-        # Get raw probabilities
-        raw_predictions = MODEL.predict(img_batch)[0]
-        
-        # Determine the AI's absolute top choice BEFORE masking
-        raw_top_index = np.argmax(raw_predictions)
-        raw_top_class = LOADED_CLASSES[raw_top_index]
-        raw_confidence = float(raw_predictions[raw_top_index])
-        
-        # --- DEBUGGING PRINT: See what the AI really thinks in your Render terminal! ---
-        print(f"USER SELECTED: {plant_type}")
-        print(f"AI RAW GUESS: {raw_top_class} ({raw_confidence * 100:.1f}%)")
-        # -----------------------------------------------------------------------------
 
-        # --- HYBRID MASKING LOGIC ---
-        if plant_type != "auto":
-            # CHANGE: Lowered the threshold from 0.80 to 0.50. 
-            # If AI is even 50% sure it's a different plant, it will throw an error!
-            if plant_type.lower() not in raw_top_class.lower() and raw_confidence > 0.50:
-                 return {
-                    "class": "Plant Mismatch Detected",
-                    "confidence": raw_confidence,
-                    "status": "Error",
-                    "solutions": {
-                        "description": f"You selected {plant_type.capitalize()}, but the AI is {(raw_confidence * 100):.0f}% sure this is a {raw_top_class.split('_')[0]} leaf.",
-                        "treatment": ["Please check your dropdown selection or ensure you are scanning the correct plant."],
-                        "prevention": ["Use 'Auto-Detect' if you are unsure of the plant species."]
-                    }
+    # FIX: Raise a proper 503 error if model isn't loaded instead of returning a silent mock
+    if app.state.model is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not loaded. Please train the model first using --mode train."
+        )
+
+    img_tensor = tf.convert_to_tensor(image)
+    img_batch = tf.expand_dims(img_tensor, 0)
+
+    # Get raw probabilities from the model
+    raw_predictions = app.state.model.predict(img_batch)[0]
+
+    # Determine the AI's top choice before any masking
+    raw_top_index = np.argmax(raw_predictions)
+    raw_top_class = app.state.class_names[raw_top_index]
+    raw_confidence = float(raw_predictions[raw_top_index])
+
+    print(f"USER SELECTED: {plant_type}")
+    print(f"AI RAW GUESS: {raw_top_class} ({raw_confidence * 100:.1f}%)")
+
+    # --- HYBRID MASKING LOGIC ---
+    if plant_type.lower() != "auto":
+        # FIX: Raised threshold from 0.50 → 0.88
+        # The old 0.50 threshold fired almost every time because softmax top predictions
+        # are nearly always above 50%, causing potato leaves to be flagged as tomato and vice versa.
+        # Now we only reject if the model is very confident (88%+) it's a different plant.
+        if plant_type.lower() not in raw_top_class.lower() and raw_confidence > MISMATCH_THRESHOLD:
+            return {
+                "class": "Plant Mismatch Detected",
+                "confidence": raw_confidence,
+                "status": "Error",
+                "solutions": {
+                    "description": f"You selected {plant_type.capitalize()}, but the AI is {(raw_confidence * 100):.0f}% sure this is a {raw_top_class.split('_')[0]} leaf.",
+                    "treatment": ["Please check your dropdown selection or ensure you are scanning the correct plant."],
+                    "prevention": ["Use 'Auto-Detect' if you are unsure of the plant species."]
                 }
-            
-            # If the mask passes, apply it
-            predictions = np.copy(raw_predictions)
-            for i, class_name in enumerate(LOADED_CLASSES):
-                if plant_type.lower() not in class_name.lower():
-                    predictions[i] = 0.0 
-            
-            total_prob = np.sum(predictions)
-            if total_prob > 0:
-                predictions = predictions / total_prob
-        else:
-            predictions = raw_predictions
-        # ------------------------------------------
+            }
 
-        # Now pick the highest probability from the filtered list
-        predicted_class = LOADED_CLASSES[np.argmax(predictions)]
-        confidence = float(np.max(predictions))
-        status = "Real Model Prediction"
+        # Apply plant-type mask: zero out classes that don't match
+        predictions = np.copy(raw_predictions)
+        for i, class_name in enumerate(app.state.class_names):
+            if plant_type.lower() not in class_name.lower():
+                predictions[i] = 0.0
+
+        total_prob = np.sum(predictions)
+        if total_prob > 0:
+            # Renormalize so probabilities sum to 1
+            predictions = predictions / total_prob
+        # If total_prob == 0, all predictions are zero → will fall through as low-confidence unknown
     else:
-        import random
-        predicted_class = "Potato___Early_blight"
-        confidence = 0.99
-        status = "MOCK_RESPONSE"
+        predictions = raw_predictions
 
-    # Strict Confidence Check
+    # Pick the highest probability class from the (possibly filtered) predictions
+    predicted_class = app.state.class_names[np.argmax(predictions)]
+    confidence = float(np.max(predictions))
+    status = "Real Model Prediction"
+
+    # Strict confidence check — return a helpful message if the model isn't sure enough
     if confidence < CONFIDENCE_THRESHOLD:
         return {
             "class": "Unknown / Unclear Image",
