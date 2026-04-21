@@ -235,22 +235,28 @@ async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
         raw_top_class = LOADED_CLASSES[raw_top_index]
         raw_confidence = float(raw_predictions[raw_top_index])
         
+        # --- DEBUGGING PRINT: See what the AI really thinks in your Render terminal! ---
+        print(f"USER SELECTED: {plant_type}")
+        print(f"AI RAW GUESS: {raw_top_class} ({raw_confidence * 100:.1f}%)")
+        # -----------------------------------------------------------------------------
+
         # --- HYBRID MASKING LOGIC ---
         if plant_type != "auto":
-            # Check if the user made a blatant mistake (AI is >80% sure it's a different plant)
-            if plant_type.lower() not in raw_top_class.lower() and raw_confidence > 0.80:
+            # CHANGE: Lowered the threshold from 0.80 to 0.50. 
+            # If AI is even 50% sure it's a different plant, it will throw an error!
+            if plant_type.lower() not in raw_top_class.lower() and raw_confidence > 0.50:
                  return {
                     "class": "Plant Mismatch Detected",
                     "confidence": raw_confidence,
                     "status": "Error",
                     "solutions": {
-                        "description": f"You selected {plant_type.capitalize()}, but the AI is highly confident this is a {raw_top_class.split('_')[0]} leaf.",
+                        "description": f"You selected {plant_type.capitalize()}, but the AI is {(raw_confidence * 100):.0f}% sure this is a {raw_top_class.split('_')[0]} leaf.",
                         "treatment": ["Please check your dropdown selection or ensure you are scanning the correct plant."],
                         "prevention": ["Use 'Auto-Detect' if you are unsure of the plant species."]
                     }
                 }
             
-            # If the AI is unsure, trust the user and apply the mask
+            # If the mask passes, apply it
             predictions = np.copy(raw_predictions)
             for i, class_name in enumerate(LOADED_CLASSES):
                 if plant_type.lower() not in class_name.lower():
