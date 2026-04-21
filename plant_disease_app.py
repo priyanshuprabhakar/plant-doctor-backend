@@ -25,7 +25,7 @@ CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
 MISMATCH_THRESHOLD = float(os.environ.get("MISMATCH_THRESHOLD", "0.88"))  # FIX: was 0.50, too aggressive
 
 # Valid plant types accepted by the API
-VALID_PLANT_TYPES = {"auto", "potato", "tomato"}
+VALID_PLANT_TYPES = {"potato", "tomato"}
 
 # --- KNOWLEDGE BASE (AI SOLUTIONS) ---
 DISEASE_KNOWLEDGE_BASE = {
@@ -237,7 +237,7 @@ async def ping():
     return {"status": "Plant Doctor AI is running", "model_loaded": app.state.model is not None}
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...), plant_type: str = Form("auto")):
+async def predict(file: UploadFile = File(...), plant_type: str = Form(...)):
     # FIX: Validate plant_type against allowed values
     if plant_type.lower() not in VALID_PLANT_TYPES:
         raise HTTPException(
